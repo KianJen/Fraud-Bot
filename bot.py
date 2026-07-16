@@ -125,6 +125,45 @@ def mentioned_user_ids(message: discord.Message) -> list[int]:
     ]
 
 
+async def resolve_target_channel() -> tuple[object | None, str | None]:
+    """Find the tracked channel, or explain precisely why we can't.
+
+    get_channel() only reads the local cache, and a channel the bot can't view
+    is never cached — so a None result is ambiguous between "wrong ID" and "no
+    permission". fetch_channel() asks the API and distinguishes the two.
+    Returns (channel, error_message); exactly one is non-None.
+    """
+    channel = bot.get_channel(TARGET_CHANNEL_ID)
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(TARGET_CHANNEL_ID)
+        except discord.NotFound:
+            return None, (
+                f"No channel with ID `{TARGET_CHANNEL_ID}` exists. That's the ID in my "
+                "`TARGET_CHANNEL_ID` setting — it's probably a message, server, or "
+                "category ID rather than a channel ID. Right-click the *channel* in the "
+                "sidebar and pick **Copy Channel ID**."
+            )
+        except discord.Forbidden:
+            return None, (
+                f"Channel `{TARGET_CHANNEL_ID}` exists, but I can't see it. Give my role "
+                "**View Channel** and **Read Message History** on that channel."
+            )
+        except discord.HTTPException as exc:
+            return None, f"Couldn't look up channel `{TARGET_CHANNEL_ID}`: {exc}"
+
+    # Categories and forums have IDs but no messages of their own.
+    if not isinstance(channel, discord.abc.Messageable):
+        kind = type(channel).__name__
+        return None, (
+            f"`{TARGET_CHANNEL_ID}` is a **{kind}**, which doesn't contain messages "
+            "directly. Point `TARGET_CHANNEL_ID` at a text channel."
+        )
+
+    return channel, None
+
+
 async def backfill_channel(channel) -> tuple[int, int, int]:
     """Scan the channel's full history, counting any message not yet counted.
 
@@ -152,6 +191,30 @@ async def backfill_channel(channel) -> tuple[int, int, int]:
 async def on_ready():
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print(f"Loaded counts for {len(mention_counts)} user(s) from {DB_PATH}")
+
+    # Surface a bad TARGET_CHANNEL_ID here rather than letting it look like
+    # "the bot runs fine but never counts anything".
+    channel, error = await resolve_target_channel()
+    if error is not None:
+        print(f"WARNING: tracked channel unusable — {error}")
+    else:
+        guild = getattr(channel, "guild", None)
+        where = f"{guild.name} / #{channel}" if guild else str(channel)
+        print(f"Tracking channel: {where} (id: {TARGET_CHANNEL_ID})")
+        if guild is not None:
+            perms = channel.permissions_for(guild.me)
+            missing = [
+                label
+                for label, ok in (
+                    ("View Channel", perms.read_messages),
+                    ("Read Message History", perms.read_message_history),
+                    ("Send Messages", perms.send_messages),
+                )
+                if not ok
+            ]
+            if missing:
+                print(f"WARNING: missing permissions on that channel: {', '.join(missing)}")
+
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s).")
@@ -217,20 +280,25 @@ async def mentions_backfill(interaction: discord.Interaction):
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
 
-    channel = bot.get_channel(TARGET_CHANNEL_ID)
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        await interaction.response.send_message(
-            f"Can't read the tracked channel (id {TARGET_CHANNEL_ID}). Check TARGET_CHANNEL_ID.",
-            ephemeral=True,
-        )
+    channel, error = await resolve_target_channel()
+    if error is not None:
+        await interaction.response.send_message(error, ephemeral=True)
         return
 
     # Check access before touching the database — otherwise a permissions
     # failure would leave the counts wiped with nothing to rebuild from.
     perms = channel.permissions_for(interaction.guild.me)
     if not (perms.read_messages and perms.read_message_history):
+        missing = [
+            label
+            for label, ok in (
+                ("View Channel", perms.read_messages),
+                ("Read Message History", perms.read_message_history),
+            )
+            if not ok
+        ]
         await interaction.response.send_message(
-            f"I need **View Channel** and **Read Message History** in {channel.mention} to do that.",
+            f"I'm missing **{'** and **'.join(missing)}** in {channel.mention}.",
             ephemeral=True,
         )
         return
