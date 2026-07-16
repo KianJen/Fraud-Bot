@@ -1,0 +1,10 @@
+.env
+.env.txt
+venv/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+README.md
+CLAUDE.md

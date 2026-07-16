@@ -1,0 +1,16 @@
+services:
+  mention-bot:
+    build: .
+    container_name: mention-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Keep the SQLite file on the volume, not in the container's writable
+      # layer, so counts survive rebuilds and redeploys.
+      DB_PATH: /data/mentions.db
+    volumes:
+      - mentions-data:/data
+
+volumes:
+  mentions-data:
