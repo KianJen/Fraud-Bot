@@ -146,9 +146,17 @@ async def resolve_target_channel() -> tuple[object | None, str | None]:
                 "sidebar and pick **Copy Channel ID**."
             )
         except discord.Forbidden:
+            # Discord returns 403 both for "in the server, can't see the
+            # channel" and "not in that server at all" — say so, and list
+            # where we actually are, since that distinguishes the two.
+            if bot.guilds:
+                where = ", ".join(f"{g.name} ({g.id})" for g in bot.guilds)
+            else:
+                where = "no servers at all — I haven't been invited anywhere"
             return None, (
-                f"Channel `{TARGET_CHANNEL_ID}` exists, but I can't see it. Give my role "
-                "**View Channel** and **Read Message History** on that channel."
+                f"Channel `{TARGET_CHANNEL_ID}` exists, but I have no access to it. "
+                "Either I'm not in that server, or I'm in it without **View Channel** "
+                f"on that channel.\nI'm currently in: {where}."
             )
         except discord.HTTPException as exc:
             return None, f"Couldn't look up channel `{TARGET_CHANNEL_ID}`: {exc}"
@@ -191,6 +199,13 @@ async def backfill_channel(channel) -> tuple[int, int, int]:
 async def on_ready():
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print(f"Loaded counts for {len(mention_counts)} user(s) from {DB_PATH}")
+
+    if bot.guilds:
+        print(f"In {len(bot.guilds)} server(s):")
+        for guild in bot.guilds:
+            print(f"  - {guild.name} (id: {guild.id})")
+    else:
+        print("WARNING: I am not in any server. Re-invite me with an OAuth2 URL.")
 
     # Surface a bad TARGET_CHANNEL_ID here rather than letting it look like
     # "the bot runs fine but never counts anything".
