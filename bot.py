@@ -6,6 +6,10 @@ and provides a /mentions command to list the counts.
 
 Counts are persisted to a SQLite file, so they survive restarts. The
 in-memory Counter is a read cache; every write goes to the database first.
+
+Every counted message's ID is recorded in `processed_messages`, so counting
+is idempotent: /mentions_backfill can rescan history that live tracking has
+already seen without double-counting anyone.
 """
 
 import os
@@ -49,6 +53,16 @@ def init_db(path: Path) -> sqlite3.Connection:
         )
         """
     )
+    # IDs of messages already counted. Only messages that contributed at
+    # least one mention are stored — re-scanning a message with no mentions
+    # adds nothing, so there's nothing to guard against.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS processed_messages (
+            message_id INTEGER PRIMARY KEY
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -58,8 +72,26 @@ def load_counts(conn: sqlite3.Connection) -> Counter[int]:
     return Counter(dict(rows))
 
 
-def record_mentions(conn: sqlite3.Connection, user_ids: list[int]) -> None:
-    """Increment each user's count by one, batched into a single transaction."""
+def record_message_mentions(
+    conn: sqlite3.Connection,
+    message_id: int,
+    user_ids: list[int],
+    commit: bool = True,
+) -> bool:
+    """Count one message's mentions, exactly once.
+
+    Claiming the message ID first makes this a no-op if the message has
+    already been counted — by live tracking or an earlier backfill — so the
+    live path and a running backfill can safely cover the same message.
+    Returns True if this call counted the message.
+    """
+    claimed = conn.execute(
+        "INSERT OR IGNORE INTO processed_messages (message_id) VALUES (?)",
+        (message_id,),
+    )
+    if claimed.rowcount == 0:
+        return False
+
     conn.executemany(
         """
         INSERT INTO mention_counts (user_id, count) VALUES (?, 1)
@@ -67,14 +99,53 @@ def record_mentions(conn: sqlite3.Connection, user_ids: list[int]) -> None:
         """,
         [(user_id,) for user_id in user_ids],
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     mention_counts.update(user_ids)
+    return True
 
 
 def reset_counts(conn: sqlite3.Connection) -> None:
+    """Wipe all counting state, including which messages have been seen."""
     conn.execute("DELETE FROM mention_counts")
+    conn.execute("DELETE FROM processed_messages")
     conn.commit()
     mention_counts.clear()
+
+
+def mentioned_user_ids(message: discord.Message) -> list[int]:
+    """The users this message should count a mention for."""
+    if message.author.bot:
+        return []
+    return [
+        user.id
+        for user in message.mentions
+        # Drop this condition if you want self-mentions counted too.
+        if user.id != message.author.id
+    ]
+
+
+async def backfill_channel(channel) -> tuple[int, int, int]:
+    """Scan the channel's full history, counting any message not yet counted.
+
+    Returns (messages_scanned, messages_counted, mentions_recorded).
+    """
+    scanned = counted = mentions = 0
+    async for message in channel.history(limit=None, oldest_first=True):
+        scanned += 1
+        user_ids = mentioned_user_ids(message)
+        if not user_ids:
+            continue
+        # Commit in batches: one fsync per message would dominate the runtime
+        # on a channel with a long history.
+        if record_message_mentions(db, message.id, user_ids, commit=False):
+            counted += 1
+            mentions += len(user_ids)
+        if scanned % 500 == 0:
+            db.commit()
+            print(f"backfill: scanned {scanned} messages, {mentions} mentions so far")
+    db.commit()
+    return scanned, counted, mentions
 
 
 @bot.event
@@ -90,21 +161,11 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore bots (including ourselves) to avoid inflating counts
-    if message.author.bot:
-        await bot.process_commands(message)
-        return
-
     # Only track mentions in the configured channel
     if message.channel.id == TARGET_CHANNEL_ID:
-        mentioned = [
-            user.id
-            for user in message.mentions
-            # Drop this condition if you want self-mentions counted too.
-            if user.id != message.author.id
-        ]
-        if mentioned:
-            record_mentions(db, mentioned)
+        user_ids = mentioned_user_ids(message)
+        if user_ids:
+            record_message_mentions(db, message.id, user_ids)
 
     await bot.process_commands(message)
 
@@ -144,6 +205,53 @@ async def mentions_prefix(ctx: commands.Context):
 async def mentions_reset(interaction: discord.Interaction):
     reset_counts(db)
     await interaction.response.send_message("Mention counts have been reset.")
+
+
+@bot.tree.command(
+    name="mentions_backfill",
+    description="Scan the tracked channel's whole history and count every mention in it (admin only).",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def mentions_backfill(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    channel = bot.get_channel(TARGET_CHANNEL_ID)
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message(
+            f"Can't read the tracked channel (id {TARGET_CHANNEL_ID}). Check TARGET_CHANNEL_ID.",
+            ephemeral=True,
+        )
+        return
+
+    # Check access before touching the database — otherwise a permissions
+    # failure would leave the counts wiped with nothing to rebuild from.
+    perms = channel.permissions_for(interaction.guild.me)
+    if not (perms.read_messages and perms.read_message_history):
+        await interaction.response.send_message(
+            f"I need **View Channel** and **Read Message History** in {channel.mention} to do that.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+    reset_counts(db)  # full rescan is authoritative, so rebuild from zero
+
+    try:
+        scanned, counted, mentions = await backfill_channel(channel)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "Lost access to the channel partway through. Counts are now incomplete — "
+            "fix my permissions and run this again."
+        )
+        return
+
+    await interaction.followup.send(
+        f"Backfill complete for {channel.mention}.\n"
+        f"Scanned **{scanned}** messages, counted **{mentions}** mentions "
+        f"across **{counted}** messages, covering **{len(mention_counts)}** users."
+    )
 
 
 if __name__ == "__main__":

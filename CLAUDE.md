@@ -30,6 +30,14 @@ without checking with the user first:
   count)`. There's no `channel_id` column — deliberately matched to the
   current single-channel scope. Multi-channel support would need a column
   add + migration.
+- **Counting is idempotent, via `processed_messages(message_id PRIMARY KEY)`.**
+  Every counting path goes through `record_message_mentions`, which claims the
+  message ID with `INSERT OR IGNORE` and does nothing if the row already
+  existed. This is what makes `/mentions_backfill` safe to re-run and safe to
+  run while live tracking is active — the two paths can both see a message and
+  it's still counted once, whichever wins the race. **Don't add a counting
+  path that bypasses this function.** Only messages contributing >=1 mention
+  are stored (re-scanning a mention-free message adds nothing anyway).
 - **Scope: single channel only**, configured via `TARGET_CHANNEL_ID` env var.
   User explicitly chose "one specific channel" over "all channels the bot can
   see." If asked to expand, consider a `TARGET_CHANNEL_IDS` list (comma-separated
@@ -65,7 +73,16 @@ referencing one — the real `.env` is the only env file present.
 - `!mentions` — identical, as a prefix-command fallback in case slash command
   sync hasn't propagated yet.
 - `/mentions_reset` — admin-only (`administrator` permission), clears all
-  counts to zero.
+  counts to zero (and clears `processed_messages`, so a later backfill can
+  rebuild from scratch).
+- `/mentions_backfill` — admin-only. Scans the tracked channel's full history
+  via `channel.history(limit=None, oldest_first=True)` and counts everything
+  not yet counted. Resets first, so a full scan is authoritative. Checks
+  `read_message_history` *before* resetting — otherwise a permissions failure
+  would wipe the counts with nothing to rebuild from. Defers the interaction
+  (a long scan blows the 3s response window; note the 15-min followup ceiling
+  on very large channels). Commits every 500 messages rather than per message,
+  since one fsync per message dominates runtime on a long history.
 
 ## Required Discord setup (already documented in README.md)
 

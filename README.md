@@ -72,6 +72,11 @@ docker compose cp mention-bot:/data/mentions.db ./mentions-backup.db
 - `!mentions` — same thing as a prefix command, in case slash commands
   haven't synced yet.
 - `/mentions_reset` — admin-only, clears the counts back to zero.
+- `/mentions_backfill` — admin-only, reads the tracked channel's entire
+  history and counts every mention in it, so the leaderboard covers messages
+  sent before the bot existed. Safe to run more than once: each message is
+  counted at most once, so a re-run won't inflate anyone's total. Needs
+  **Read Message History** on the channel.
 
 ## Notes / things you can tweak
 
