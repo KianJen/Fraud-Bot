@@ -252,11 +252,11 @@ def build_leaderboard_text(guild: discord.Guild) -> str:
     if not mention_counts:
         return "No mentions have been tracked yet in that channel."
 
-    lines = ["**Mention Leaderboard**"]
+    lines = ["**Biggest Frauds**"]
     for rank, (user_id, count) in enumerate(mention_counts.most_common(), start=1):
         member = guild.get_member(user_id)
         name = member.display_name if member else f"<@{user_id}> (left server)"
-        lines.append(f"{rank}. {name} — {count} mention{'s' if count != 1 else ''}")
+        lines.append(f"{rank}. {name} — {count} incident{'s' if count != 1 else ''}")
 
     return "\n".join(lines)
 
